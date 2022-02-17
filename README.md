@@ -5,7 +5,8 @@ command `tail -f [file1 file2 file3 ...]` except it is directory based.  All the
 a single directory (up to 10) that match a regular expression will be tailed. If new files
 that match the regex are added those files will automatically be added to the list of watched
 files.  Default values for the file name regex and "beep" regex are hard-coded to values that
-are convenient for me.
+are convenient for me.  Regular expressions use the JavaScript flavor (the default for the 
+C++17 std::regex).
 
 ```
     Monitor a directory for the newest files that match a pattern and print any
