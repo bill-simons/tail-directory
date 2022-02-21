@@ -46,6 +46,9 @@ typedef std::shared_ptr<unique_handle<GenericHandlePolicy>> SharedUniqueFileHand
 /** read line max buffer size*/
 const std::streamsize BUFLEN{ 4096 };
 
+/** polling inerval */
+DWORD  POLLING_INTERVAL_MILLIS{ 750 };
+
 /** signal flags for worker thread used in FileMonitorData struct */
 const int DIRECTORY_MODIFIED = 0x1000;
 const int STOP_MONITORING    = 0x4000;
@@ -54,17 +57,51 @@ const int STOP_MONITORING    = 0x4000;
 // global data
 //
 
-/** Global point to data used by monitoring thread.  Contains "signal" integer used by main thread to communicate with worker. */
-GlobalData *GLOBAL_DATA_PTR{nullptr};
+/**
+ * Global object used to pass signals from main thread to worker thread
+ * and by interrupt handlers to clean up on exit.
+ */
+ std::atomic<GlobalData *> pGlobalData{nullptr};
 
 
 ///////////////////////////////////////////////////////////////////////////////
 // classes /structs
 //
 
+/**
+ * Global data class used by the worker thread that polls for changed files.
+ */
+struct GlobalData {
+   std::atomic<int> signal{0};    // signal from main thread to worker thread
+
+   // directory change handle
+   HANDLE directoryMonitorHandle{INVALID_HANDLE_VALUE};
+
+   GlobalData(HANDLE h) : directoryMonitorHandle{h} {}
+   ~GlobalData() { closeDirectoryMonitorHandle();  }
+   void closeDirectoryMonitorHandle() {
+      if (directoryMonitorHandle != NULL) {
+         FindCloseChangeNotification(directoryMonitorHandle);
+         directoryMonitorHandle = NULL;
+      }
+   }
+};
+
+// Information passed from the main to the file monitor thread
+struct Options {
+   fs::path    logdir;
+   std::regex  filename_regex;
+   std::regex  beep_regex;
+   bool        beepOnException;
+   unsigned    max_files;
+   Options(fs::path &path, std::regex &frx, std::regex &brx, bool beep, unsigned max)
+   : logdir{ path }, filename_regex{ frx }, beep_regex{ brx }, beepOnException{beep}, max_files{max}
+   {
+   }
+};
 
 /**
-  Policy object for unique_handle when dealing with generic handle returned from 
+  Policy object for unique_handle when dealing with generic handle returned from
   CreateFile or any other call that uses the CloseHandle call to dispose.
 */
 struct GenericHandlePolicy {
@@ -76,39 +113,6 @@ struct GenericHandlePolicy {
    }
    static handle_type get_null() { return NULL; }
    static bool is_null(handle_type handle) {  return handle == NULL; }
-};
-
-/**
- * Global data class used by the worker thread that polls for changed files.
- */
-struct GlobalData {
-   // Information used by the file monitor thread
-   fs::path    logdir;
-   std::regex  filename_regex;
-   std::regex  beep_regex;
-   bool        beepOnException;
-   DWORD       polling_interval_millis{750};
-
-   // data shared between main thread threads
-   std::atomic<int> signal{0};    // signal from main thread to worker thread
-
-   // directory change handle created by the main thread that needs to be cleaned
-   // up by sigmnal/interrupt handlers
-   HANDLE directoryMonitorHandle{INVALID_HANDLE_VALUE};
-
-   GlobalData(fs::path &path, std::regex &frx, std::regex &brx, bool beep)
-         : logdir{ path }, filename_regex{ frx }, beep_regex{ brx }, beepOnException{beep}
-   {
-   }
-   void closeDirectoryMonitorHandle() {
-      if (directoryMonitorHandle != NULL) {
-         FindCloseChangeNotification(directoryMonitorHandle);
-         directoryMonitorHandle = NULL;
-      }
-   }
-   ~GlobalData() {
-      closeDirectoryMonitorHandle();
-   }
 };
 
 /**
@@ -200,6 +204,7 @@ private:
    args::ValueFlag<std::string> file_pattern;
    args::ValueFlag<std::string> line_beep_pattern;
    args::Flag nobeep;
+   args::ValueFlag<int> max_files;
    int stat{0};
 
 public:
@@ -210,7 +215,9 @@ public:
          file_pattern(parser, "pattern", "Regex for matching file names. The identifier that uniquely identifies each file type must be enclosed in parenthesis as the first capturing group.",
                       {'p', "pattern"}),
          line_beep_pattern(parser, "pattern", "Regex that triggers a beep when an output line matches.", {'b', "beep"}),
-         nobeep(parser, "nobeep", "Disable checking for the 'beep' regular expression.", {'n', "nobeep"}) {
+         nobeep(parser, "nobeep", "Disable checking for the 'beep' regular expression.", {'n', "nobeep"}),
+         max_files(parser, "max_files", "Maximum number of files to match", {'m', "max"})
+   {
       try {
          parser.ParseCLI(argc, argv);
       } catch (args::Help) {
@@ -230,27 +237,27 @@ public:
       return stat;
    }
 
-   bool getBeep() {
-      return nobeep ? false : true;
-   }
-   std::string getDir() {
-      return dir ? args::get(dir) : "";
-   }
-
-   std::string getFilePattern() {
-      return file_pattern ? args::get(file_pattern) : "";
-   }
-
-   std::string getBeepPattern() {
-      return line_beep_pattern ? args::get(line_beep_pattern) : "";
-   }
-
    bool getHelp() {
       return help ? true : false;
    }
 
    void showHelp() {
       std::cout << parser;
+   }
+   std::string getDir() {
+      return dir ? args::get(dir) : "";
+   }
+   std::string getFilePattern() {
+      return file_pattern ? args::get(file_pattern) : "";
+   }
+   std::string getBeepPattern() {
+      return line_beep_pattern ? args::get(line_beep_pattern) : "";
+   }
+   bool getBeep() {
+      return nobeep ? false : true;
+   }
+   int getMaxFiles() {
+      return max_files ? args::get(max_files) : 10;
    }
 };
 
@@ -306,7 +313,7 @@ std::string get_last_error() {
    return sstr.str();
 }
 
-SharedUniqueFileHandlePtr openFileHandle(fs::path path) {
+SharedUniqueFileHandlePtr open_file_handle(fs::path path) {
    SharedUniqueFileHandlePtr sharedHandle;
    HANDLE hFile = CreateFile(path.c_str(), 0,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
@@ -370,22 +377,22 @@ std::shared_ptr<PrefixLogFileInfoMap> collectLogFiles(fs::path &logdir, std::reg
    return std::shared_ptr<PrefixLogFileInfoMap>(pmap);
 }
 
-void showTooManyFilesMessage(std::shared_ptr<PrefixLogFileInfoMap> pmap) {
-   std::cout << "Too many files match the given pattern" << std::endl;
+void showTooManyFilesMessage(std::shared_ptr<PrefixLogFileInfoMap> pmap, unsigned max_files) {
+   std::cout << "Too many files match the given pattern (maximum number of files is " << max_files << ", use the -m option to increase the limit)." << std::endl;
    std::cout << std::setw(25) << std::left << "Unique Prefix" << " : " << std::setw(50) << "File Name" << std::endl;
    std::cout << std::setw(25) << std::left << "==================" << " : " << "=================================================" << std::endl;
    for(auto entry : *pmap) {
       auto prefix = entry.first;
       auto pinfo = entry.second;
       auto filename = pinfo->getPath().filename();
-      std::cout << std::setw(25) << std::left << filename << " : " << std::setw(50) << filename << std::endl;
+      std::cout << std::setw(25) << std::left << prefix << " : " << std::setw(50) << filename << std::endl;
    }
 }
 
-std::shared_ptr<PrefixLogFileInfoMap> collectInitialLogFiles(fs::path &logdir, std::regex &filename_regex) {
+std::shared_ptr<PrefixLogFileInfoMap> collectInitialLogFiles(fs::path &logdir, std::regex &filename_regex, unsigned max_files) {
    std::shared_ptr<PrefixLogFileInfoMap> pmap = collectLogFiles(logdir, filename_regex);
    if (pmap) {
-      if(pmap->size() < 11) {
+      if(pmap->size() <= max_files) {
          std::cout << "Press CTRL-C to exit." << std::endl;
          if (pmap->empty()) {
             std::cout << "********* WARNING: no files found that match the file name regular expression." << std::endl;
@@ -395,14 +402,14 @@ std::shared_ptr<PrefixLogFileInfoMap> collectInitialLogFiles(fs::path &logdir, s
             }
          }
       } else {
-         showTooManyFilesMessage(pmap);
+         showTooManyFilesMessage(pmap, max_files);
          pmap.reset();
       }
    }
    return pmap;
 }
 
-void updateLogFilesMap(std::shared_ptr<PrefixLogFileInfoMap> oldMap, std::shared_ptr<PrefixLogFileInfoMap> newMap) {
+void updateLogFilesMap(std::shared_ptr<PrefixLogFileInfoMap> oldMap, std::shared_ptr<PrefixLogFileInfoMap> newMap, unsigned max_files) {
    std::set<std::string> oldKeys;
    std::set<std::string> newKeys;
    std::set<std::string> removed;
@@ -417,8 +424,13 @@ void updateLogFilesMap(std::shared_ptr<PrefixLogFileInfoMap> oldMap, std::shared
    for (auto newEntry : *newMap) {
       auto oldEntryIt = oldMap->find(newEntry.first);
       if (oldEntryIt == oldMap->end()) {
-         oldMap->emplace(newEntry);
-         newEntry.second->startWatching();
+         if (oldMap->size() < max_files) {
+            oldMap->emplace(newEntry);
+            newEntry.second->startWatching();
+         }
+         else {
+            std::cout << "********* Maximum number of files are being monitored ("  << max_files << "). Not watching new file " << newEntry.second->getPath().filename() << std::endl;
+         }
       }
       else {
          std::string prefix = oldEntryIt->first;
@@ -483,7 +495,7 @@ void tailAllFiles(std::shared_ptr<PrefixLogFileInfoMap> pmap, std::regex *pbeep_
    for (auto entry : *pmap) {
       std::string prefix = entry.first;
       auto pinfo = entry.second;
-      SharedUniqueFileHandlePtr hPtr = openFileHandle(pinfo->getPath());
+      SharedUniqueFileHandlePtr hPtr = open_file_handle(pinfo->getPath());
       if (hPtr) {
          HANDLE h = hPtr->get();
          FILETIME fileTime;
@@ -509,24 +521,32 @@ unsigned __stdcall workerThreadProc(void* userData) {
    // worker thread that runs a polling loop looking for changes in the files
    // being monitored, and that updates the list of monitored files when the
    // main thread signals that the directoy has changed.
-   GlobalData *pdata = (GlobalData*)userData;
-   fs::path &logdir = pdata->logdir;
-   std::regex &filename_regex = pdata->filename_regex;
-   std::shared_ptr<PrefixLogFileInfoMap> pmap = collectInitialLogFiles(logdir,filename_regex);
+
+   Options *pdata = (Options*)userData;
+
+   // copy data to local variables just in case the data object goes out of scope
+   // (main thread exits early)
+   fs::path   logdir = pdata->logdir;
+   std::regex filename_regex = pdata->filename_regex;
+   std::regex beep_regex = pdata->beep_regex;
+   std::regex *pbeep_regex = pdata->beepOnException ? &(beep_regex) : nullptr;
+   int max_files = pdata->max_files;
+   DWORD millis = POLLING_INTERVAL_MILLIS;
+
+   std::shared_ptr<PrefixLogFileInfoMap> pmap = collectInitialLogFiles(logdir,filename_regex,max_files);
    if(pmap) {
-      DWORD millis = pdata->polling_interval_millis;
-      std::regex *pbeep_regex = pdata->beepOnException ? &(pdata->beep_regex) : nullptr;
-      while (GLOBAL_DATA_PTR != NULL) {
-         int signal = pdata->signal.exchange(0);
+      while (pGlobalData.load() != nullptr) {
+         int signal = pGlobalData.load()->signal.exchange(0);
          if ((signal & STOP_MONITORING) != 0) {
             break;
          }
          if ((signal & DIRECTORY_MODIFIED) != 0) {
             std::shared_ptr<PrefixLogFileInfoMap> pNewMap = collectLogFiles(logdir, filename_regex);
-            updateLogFilesMap(pmap, pNewMap);
+            updateLogFilesMap(pmap, pNewMap, max_files);
          }
          tailAllFiles(pmap,pbeep_regex);
-         if ((GLOBAL_DATA_PTR == NULL || (pdata->signal.load() & STOP_MONITORING) != 0)) {
+         GlobalData *p = pGlobalData.load();
+         if ((p == nullptr || (p->signal.load() & STOP_MONITORING) != 0)) {
             break;
          }
          Sleep(millis);
@@ -535,28 +555,34 @@ unsigned __stdcall workerThreadProc(void* userData) {
    return 0;
 }
 
-int mainThreadProc(fs::path &logdir, std::regex &filename_regex, std::regex &beep_regex, bool beepOnException) {
+int mainThreadProc(Options *pOptions) {
    // main thread that starts the file monitor worker thread running and then 
    // waits to be notified of changes to the monitored directory. When notified
    // it signals the worker thread to update the list of monitored files.
+
+   // The polling thread is necessary because the directory change notification
+   // (FindFirstChangeNotification) with FILE_NOTIFY_CHANGE_LAST_WRITE doesn't
+   // send notifications immediately when a file is changed due to write buffering.
+   // Changes are sent only when the buffer is written to disk.  With polling,
+   // the write buffer is flushed to disk when a new handle is opened on the file.
+
    int stat = 0;
-   LPCWSTR path = logdir.c_str();
+   LPCWSTR path = pOptions->logdir.c_str();
    HANDLE hDirMonitor = FindFirstChangeNotification(path, false, FILE_NOTIFY_CHANGE_FILE_NAME);
-   GLOBAL_DATA_PTR = new GlobalData(logdir, filename_regex, beep_regex, beepOnException);
-   GLOBAL_DATA_PTR->directoryMonitorHandle = hDirMonitor;
+   pGlobalData.store(new GlobalData(hDirMonitor));
    if (hDirMonitor == NULL || hDirMonitor == INVALID_HANDLE_VALUE) {
       stat = 4;
       std::cout << "Unable to monitor directory for changes: " << get_last_error() << std::endl;
    } else {
       _beginthreadex_proc_type runnable = &workerThreadProc;
-      uintptr_t pollingThreadHandle = _beginthreadex(nullptr,0,runnable,GLOBAL_DATA_PTR,0,nullptr);
+      uintptr_t pollingThreadHandle = _beginthreadex(nullptr,0,runnable,pOptions,0,nullptr);
       if (pollingThreadHandle != -1) {
          HANDLE hPollingThread = (HANDLE)pollingThreadHandle;  // beginThread ultimately calls the OS CreateThread so the handles are compatible with the Wait functions
          HANDLE pHandles[2]{ hDirMonitor,hPollingThread };
          while (true) {
             int stat = WaitForMultipleObjects(2, pHandles, false, INFINITE);
             if (stat == WAIT_OBJECT_0) {
-               GLOBAL_DATA_PTR->signal |= DIRECTORY_MODIFIED;
+               pGlobalData.load()->signal |= DIRECTORY_MODIFIED;
                if (!FindNextChangeNotification(hDirMonitor)) {
                   stat = 5;
                   std::cout << "********* FindNextChangeNotification failed.  Error=" << get_last_error() << std::endl;
@@ -574,7 +600,7 @@ int mainThreadProc(fs::path &logdir, std::regex &filename_regex, std::regex &bee
                break;
             }
          }
-         GLOBAL_DATA_PTR->signal.store(STOP_MONITORING);
+         pGlobalData.load()->signal.store(STOP_MONITORING);
          WaitForSingleObject(hPollingThread,2000);
       }
       else {
@@ -582,8 +608,8 @@ int mainThreadProc(fs::path &logdir, std::regex &filename_regex, std::regex &bee
       }
    }
 
-   delete GLOBAL_DATA_PTR;  // closes the FindFirstChangeNotification handle stored in "directoryMonitorHandle" field
-   GLOBAL_DATA_PTR = nullptr;
+   GlobalData *p = pGlobalData.exchange(nullptr);
+   delete p;   // closes the FindFirstChangeNotification handle
    return stat;
 }
 
@@ -596,9 +622,9 @@ BOOL WINAPI windowsCtrlHandler(DWORD fdwCtrlType) {
    case CTRL_LOGOFF_EVENT:
    case CTRL_SHUTDOWN_EVENT:
       std::cout << "********* Shutdown in CTRL-C handler" << std::endl;
-      if (GLOBAL_DATA_PTR != nullptr) {
-         GLOBAL_DATA_PTR->signal = STOP_MONITORING;
-         GLOBAL_DATA_PTR->closeDirectoryMonitorHandle();
+      if (pGlobalData.load() != nullptr) {
+         pGlobalData.load()->signal.store(STOP_MONITORING);
+         pGlobalData.load()->closeDirectoryMonitorHandle();
       }
       return TRUE;
    default:
@@ -608,9 +634,9 @@ BOOL WINAPI windowsCtrlHandler(DWORD fdwCtrlType) {
 
 void signalHandler(int s) {
    std::cout << "********* Shutdown in signal handler" << std::endl;
-   if (GLOBAL_DATA_PTR != nullptr) {
-      GLOBAL_DATA_PTR->signal = STOP_MONITORING;
-      GLOBAL_DATA_PTR->closeDirectoryMonitorHandle();
+   if (pGlobalData.load() != nullptr) {
+      pGlobalData.load()->signal.store(STOP_MONITORING);
+      pGlobalData.load()->closeDirectoryMonitorHandle();
    }
    exit(0);
 }
@@ -652,7 +678,9 @@ int main(int argc, char *argv[]) {
          std::regex filename_regex(line_pat);
          std::regex beep_regex(beep_pat);
          if (installExitHandlers()) {
-            stat = mainThreadProc(logdir, filename_regex, beep_regex, beepOnException);
+            unsigned maxFiles = (unsigned)args.getMaxFiles();
+            Options options{logdir, filename_regex, beep_regex, beepOnException, maxFiles};
+            stat = mainThreadProc(&options);
          }
          else {
             stat = 3;
