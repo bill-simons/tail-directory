@@ -8,7 +8,9 @@ files.  Default values for the file name regex and "beep" regex are hard-coded t
 are convenient for me.  Regular expressions use the JavaScript flavor (the default for the 
 C++17 std::regex).
 
-```
+<pre>
+tailer.exe [directory] {OPTIONS}
+    
     Monitor a directory for the newest files that match a pattern and print any
     lines added to those files on the console. Optionally emit a beep when a
     line contains a matching 'beep pattern'.
@@ -28,10 +30,13 @@ C++17 std::regex).
                                         output line matches.
       -n, --nobeep                      Disable checking for the 'beep' regular
                                         expression.
-```
+      -m[max_files], --max=[max_files]  Maximum number of files to match (defaults to 10)
+</pre>
+
+
 
 Example output:
-```
+<pre>
 $ tailer.exe ./user/logs
 Scanning directory:   ./user/logs
 File name regex:      (tfe.*)_\d+\.log
@@ -60,4 +65,4 @@ tfe: 2022-02-16 18:51:52,043 INFO [main] - Unit System initialized (Time: 40ms).
 tfe: 2022-02-16 18:51:52,066 INFO [main] - The Property Type System initialized (Time: 66ms)
 tfe: 2022-02-16 18:51:52,121 INFO [main] - CoreUI Load Time=3ms Memory=0
 tfe: 2022-02-16 18:51:52,125 INFO [main] - CoreUI Start Time=4ms Memory=0
-```
+</pre>
