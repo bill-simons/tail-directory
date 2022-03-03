@@ -46,10 +46,10 @@ typedef std::shared_ptr<unique_handle<GenericHandlePolicy>> SharedUniqueFileHand
 /** read line max buffer size*/
 const std::streamsize BUFLEN{ 4096 };
 
-/** polling inerval */
-DWORD  POLLING_INTERVAL_MILLIS{ 750 };
+/** polling interval */
+const DWORD POLLING_INTERVAL_MILLIS{ 750 };
 
-/** signal flags for worker thread used in FileMonitorData struct */
+/** signal flags passed from main thread to worker thread  */
 const int DIRECTORY_MODIFIED = 0x1000;
 const int STOP_MONITORING    = 0x4000;
 
@@ -58,8 +58,7 @@ const int STOP_MONITORING    = 0x4000;
 //
 
 /**
- * Global object used to pass signals from main thread to worker thread
- * and by interrupt handlers to clean up on exit.
+ * Global object -- contains main-to-worker thread signals and directory monitor handle.
  */
  std::atomic<GlobalData *> pGlobalData{nullptr};
 
@@ -87,7 +86,7 @@ struct GlobalData {
    }
 };
 
-// Information passed from the main to the file monitor thread
+// Program options passed to the worker thread.
 struct Options {
    fs::path    logdir;
    std::regex  filename_regex;
@@ -233,32 +232,14 @@ public:
       }
    }
 
-   int getStat() {
-      return stat;
-   }
-
-   bool getHelp() {
-      return help ? true : false;
-   }
-
-   void showHelp() {
-      std::cout << parser;
-   }
-   std::string getDir() {
-      return dir ? args::get(dir) : "";
-   }
-   std::string getFilePattern() {
-      return file_pattern ? args::get(file_pattern) : "";
-   }
-   std::string getBeepPattern() {
-      return line_beep_pattern ? args::get(line_beep_pattern) : "";
-   }
-   bool getBeep() {
-      return nobeep ? false : true;
-   }
-   int getMaxFiles() {
-      return max_files ? args::get(max_files) : 10;
-   }
+   int getStat() {  return stat;  }
+   bool getHelp() { return help ? true : false;  }
+   void showHelp() {  std::cout << parser; }
+   std::string getDir() {  return dir ? args::get(dir) : ""; }
+   std::string getFilePattern() {  return file_pattern ? args::get(file_pattern) : ""; }
+   std::string getBeepPattern() {  return line_beep_pattern ? args::get(line_beep_pattern) : ""; }
+   bool getBeep() {  return nobeep ? false : true; }
+   int getMaxFiles() {  return max_files ? args::get(max_files) : 10; }
 };
 
 
@@ -269,7 +250,7 @@ public:
 int64_t filetime_to_unix_time(FILETIME &fileTime) {
    //Get the number of seconds since January 1, 1970 12:00am UTC
    const int64_t UNIX_TIME_START = 0x019DB1DED53E8000; // January 1, 1970 (start of Unix epoch) in "ticks"
-   const int64_t TICKS_PER_SECOND = 10000;             // a tick is 10 ms
+   const int64_t TICKS_PER_SECOND = 10000;             // Windows FILETIME tick is 10 ns
 
    //Copy the low and high parts of FILETIME into a LARGE_INTEGER
    //This is so we can access the full 64-bits as an Int64 without causing an alignment fault
@@ -450,7 +431,7 @@ void tailOneFile(LogFileInfo &info, int64_t fileSize, int64_t writeTime, std::re
    if ((writeTime != info.getWriteTime()) || (fileSize != prevSize)) {
       if (fileSize < prevSize) {
          // file size has shrunk -- start tailing from new end of file
-         info.setLastTailedPosition(info.getFileSize());
+         info.setLastTailedPosition(fileSize);
       } else if(fileSize > prevSize) {
          // data has been added to the file
          std::ifstream ifs(info.getPath().c_str());
@@ -518,9 +499,10 @@ void tailAllFiles(std::shared_ptr<PrefixLogFileInfoMap> pmap, std::regex *pbeep_
 }
 
 unsigned __stdcall workerThreadProc(void* userData) {
-   // worker thread that runs a polling loop looking for changes in the files
-   // being monitored, and that updates the list of monitored files when the
-   // main thread signals that the directoy has changed.
+   // worker thread -- runs a polling loop that checks for changes in the
+   // monitored files on each pass.  When the main thread signals that the
+   // parent directory has changes with new, deleted, or renamed files it
+   // also updates the list of files being monitored.
 
    Options *pdata = (Options*)userData;
 
@@ -556,9 +538,9 @@ unsigned __stdcall workerThreadProc(void* userData) {
 }
 
 int mainThreadProc(Options *pOptions) {
-   // main thread that starts the file monitor worker thread running and then 
-   // waits to be notified of changes to the monitored directory. When notified
-   // it signals the worker thread to update the list of monitored files.
+   // main thread.  Opens a directory monitor handle, starts the worker thread
+   // and waits for directory change notifications or for the worker thread
+   // to terminate.
 
    // The polling thread is necessary because the directory change notification
    // (FindFirstChangeNotification) with FILE_NOTIFY_CHANGE_LAST_WRITE doesn't
