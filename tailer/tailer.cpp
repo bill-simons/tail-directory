@@ -649,7 +649,7 @@ int main(int argc, char *argv[]) {
       std::string line_pat = args.getFilePattern();
       std::string beep_pat = args.getBeepPattern();
       bool beepOnException = args.getBeep();
-      if (line_pat.empty()) line_pat = "(tfe.*)_\\d+\\.log";
+      if (line_pat.empty()) line_pat = "(ess.*|tfe.*)_\\d+\\.log";
       if (beep_pat.empty()) beep_pat = ".*[a-zA-Z]+\\.[a-zA-Z]+(Exception|Error):";   // something.somethingError:  or something.somethingException:
       std::cout << "Scanning directory:   " << logdir << std::endl;
       std::cout << "File name regex:      " << line_pat << std::endl;
